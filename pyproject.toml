@@ -1,0 +1,11 @@
+[project]
+name = "ai-news-aggregator"
+version = "0.1.0"
+description = "Aggregate and summarize AI news from multiple sources."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
