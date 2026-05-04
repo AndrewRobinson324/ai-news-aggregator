@@ -16,6 +16,9 @@ env/
 .env
 .env.*
 
+# Upstream reference tree (zip extract); remove if you want it versioned
+ai-news-aggregator-master/
+
 # OS/editor files
 .DS_Store
 .idea/
