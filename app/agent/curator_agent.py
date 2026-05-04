@@ -1,13 +1,28 @@
+import logging
 import os
+import time
 from typing import List
 
 from dotenv import load_dotenv
+from google import genai
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from app.config import use_openai_llm
+from app.config import (
+    curator_llm_max_digests,
+    curator_prompt_summary_chars,
+    gemini_model,
+    llm_backend,
+    ollama_curator_max_tokens,
+    ollama_model,
+    openai_model_curator,
+)
+from app.llm.ollama_client import build_ollama_openai_client
+from app.llm.structured import structured_gemini, structured_ollama_chat, structured_openai
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 class RankedArticle(BaseModel):
@@ -50,6 +65,13 @@ def _sort_key(d: dict) -> float:
     return float(ts()) if callable(ts) else 0.0
 
 
+def _clip_for_prompt(text: str, max_chars: int) -> str:
+    s = (text or "").replace("\n", " ").strip()
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 1] + "…"
+
+
 def _rank_by_recency(digests: List[dict]) -> List[RankedArticle]:
     ordered = sorted(digests, key=_sort_key, reverse=True)
     out: List[RankedArticle] = []
@@ -61,7 +83,7 @@ def _rank_by_recency(digests: List[dict]) -> List[RankedArticle]:
                 digest_id=d["id"],
                 relevance_score=round(score, 1),
                 rank=i + 1,
-                reasoning="Ordered by digest time (newest first). Template mode — no OpenAI ranking.",
+                reasoning="Ordered by digest time (newest first). Template mode — no LLM ranking.",
             )
         )
     return out
@@ -70,11 +92,20 @@ def _rank_by_recency(digests: List[dict]) -> List[RankedArticle]:
 class CuratorAgent:
     def __init__(self, user_profile: dict):
         self.user_profile = user_profile
-        self._client: OpenAI | None = None
-        self.model = "gpt-4.1"
+        self._openai: OpenAI | None = None
+        self._gemini: genai.Client | None = None
+        self._ollama_client: OpenAI | None = None
+        self._backend = llm_backend()
+        self.openai_model = openai_model_curator()
+        self.gemini_model = gemini_model()
+        self.ollama_model = ollama_model()
         self.system_prompt = self._build_system_prompt()
-        if use_openai_llm():
-            self._client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        if self._backend == "openai":
+            self._openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        elif self._backend == "gemini":
+            self._gemini = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        elif self._backend == "ollama":
+            self._ollama_client = build_ollama_openai_client()
 
     def _build_system_prompt(self) -> str:
         interests = "\n".join(f"- {interest}" for interest in self.user_profile["interests"])
@@ -98,34 +129,93 @@ Preferences:
         if not digests:
             return []
 
-        if not use_openai_llm():
+        if self._backend == "none":
             return _rank_by_recency(digests)
 
-        assert self._client is not None
+        summary_chars = curator_prompt_summary_chars(self._backend)
+        ordered_full = sorted(digests, key=_sort_key, reverse=True)
+        max_llm = curator_llm_max_digests(self._backend)
+        tail: List[dict] = []
+        working = ordered_full
+        if max_llm is not None and len(ordered_full) > max_llm:
+            working = ordered_full[:max_llm]
+            tail = ordered_full[max_llm:]
+            logger.info(
+                "Curator: LLM ranks newest %d digest(s); %d older digest(s) appended by recency after",
+                len(working),
+                len(tail),
+            )
+
         digest_list = "\n\n".join(
             [
-                f"ID: {d['id']}\nTitle: {d['title']}\nSummary: {d['summary']}\nType: {d['article_type']}"
-                for d in digests
+                f"ID: {d['id']}\nTitle: {d['title']}\nSummary: {_clip_for_prompt(str(d.get('summary')), summary_chars)}\nType: {d['article_type']}"
+                for d in working
             ]
         )
 
-        user_prompt = f"""Rank these {len(digests)} AI news digests based on the user profile:
+        n = len(working)
+        user_prompt = f"""Rank these {n} AI news digests based on the user profile:
 
 {digest_list}
 
-Provide a relevance score (0.0-10.0) and rank (1-{len(digests)}) for each article, ordered from most to least relevant."""
+Provide a relevance score (0.0-10.0) and rank (1-{n}) for each article, ordered from most to least relevant."""
 
-        try:
-            response = self._client.responses.parse(
-                model=self.model,
-                instructions=self.system_prompt,
-                temperature=0.3,
-                input=user_prompt,
-                text_format=RankedDigestList,
+        logger.info("Curator: calling LLM backend=%s on %d digest(s)…", self._backend, n)
+        t0 = time.perf_counter()
+
+        ranked_list: RankedDigestList | None = None
+        if self._backend == "openai":
+            assert self._openai is not None
+            ranked_list = structured_openai(
+                self._openai,
+                self.openai_model,
+                self.system_prompt,
+                user_prompt,
+                0.3,
+                RankedDigestList,
+            )
+        elif self._backend == "gemini":
+            assert self._gemini is not None
+            ranked_list = structured_gemini(
+                self._gemini,
+                self.gemini_model,
+                self.system_prompt,
+                user_prompt,
+                0.3,
+                RankedDigestList,
+            )
+        else:
+            assert self._ollama_client is not None
+            ranked_list = structured_ollama_chat(
+                self._ollama_client,
+                self.ollama_model,
+                self.system_prompt,
+                user_prompt,
+                0.3,
+                RankedDigestList,
+                max_tokens=ollama_curator_max_tokens(),
             )
 
-            ranked_list = response.output_parsed
-            return ranked_list.articles if ranked_list else []
-        except Exception as e:
-            print(f"Error ranking digests: {e}")
-            return []
+        logger.info("Curator: LLM returned in %.1fs", time.perf_counter() - t0)
+
+        articles = ranked_list.articles if ranked_list else []
+        if not articles:
+            logger.warning("LLM ranking returned no results; falling back to recency order")
+            return _rank_by_recency(digests)
+
+        articles.sort(key=lambda a: a.rank)
+        articles = [a.model_copy(update={"rank": i}) for i, a in enumerate(articles, start=1)]
+
+        if tail:
+            base = len(articles)
+            for i, d in enumerate(tail):
+                articles.append(
+                    RankedArticle(
+                        digest_id=d["id"],
+                        relevance_score=max(2.0, 4.5 - i * 0.2),
+                        rank=base + i + 1,
+                        reasoning="Older than curated batch — ordered by recency.",
+                    )
+                )
+
+        return articles

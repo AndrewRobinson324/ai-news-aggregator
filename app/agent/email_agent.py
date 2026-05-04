@@ -3,10 +3,13 @@ from datetime import datetime
 from typing import List, Optional
 
 from dotenv import load_dotenv
+from google import genai
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from app.config import use_openai_llm
+from app.config import gemini_model, llm_backend, ollama_model, openai_model_email
+from app.llm.ollama_client import build_ollama_openai_client
+from app.llm.structured import structured_gemini, structured_ollama_chat, structured_openai
 
 load_dotenv()
 
@@ -67,10 +70,19 @@ Keep it concise (2-3 sentences for the introduction), friendly, and professional
 class EmailAgent:
     def __init__(self, user_profile: dict):
         self.user_profile = user_profile
-        self._client: OpenAI | None = None
-        self.model = "gpt-4o-mini"
-        if use_openai_llm():
-            self._client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self._openai: OpenAI | None = None
+        self._gemini: genai.Client | None = None
+        self._ollama_client: OpenAI | None = None
+        self._backend = llm_backend()
+        self.openai_model = openai_model_email()
+        self.gemini_model = gemini_model()
+        self.ollama_model = ollama_model()
+        if self._backend == "openai":
+            self._openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        elif self._backend == "gemini":
+            self._gemini = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        elif self._backend == "ollama":
+            self._ollama_client = build_ollama_openai_client()
 
     def generate_introduction(self, ranked_articles: List) -> EmailIntroduction:
         current_date = datetime.now().strftime("%B %d, %Y")
@@ -82,17 +94,16 @@ class EmailAgent:
                 introduction="No articles were ranked today.",
             )
 
-        if not use_openai_llm():
+        if self._backend == "none":
             n = len(ranked_articles[:10])
             return EmailIntroduction(
                 greeting=f"Hey {name}, here is your AI news roundup for {current_date}.",
                 introduction=(
                     f"Below are up to {n} items from your configured sources. "
-                    "Summaries use template excerpts (set USE_OPENAI=true with a valid API key for LLM-written digests)."
+                    "Summaries use template excerpts, or enable an LLM: USE_GEMINI, USE_OPENAI, or USE_OLLAMA."
                 ),
             )
 
-        assert self._client is not None
         top_articles = ranked_articles[:10]
         article_summaries = "\n".join(
             [
@@ -108,26 +119,48 @@ Top 10 ranked articles:
 
 Generate a greeting and introduction that previews these articles."""
 
-        try:
-            response = self._client.responses.parse(
-                model=self.model,
-                instructions=EMAIL_PROMPT,
-                temperature=0.7,
-                input=user_prompt,
-                text_format=EmailIntroduction,
+        intro: EmailIntroduction | None = None
+        if self._backend == "openai":
+            assert self._openai is not None
+            intro = structured_openai(
+                self._openai,
+                self.openai_model,
+                EMAIL_PROMPT,
+                user_prompt,
+                0.7,
+                EmailIntroduction,
+            )
+        elif self._backend == "gemini":
+            assert self._gemini is not None
+            intro = structured_gemini(
+                self._gemini,
+                self.gemini_model,
+                EMAIL_PROMPT,
+                user_prompt,
+                0.7,
+                EmailIntroduction,
+            )
+        else:
+            assert self._ollama_client is not None
+            intro = structured_ollama_chat(
+                self._ollama_client,
+                self.ollama_model,
+                EMAIL_PROMPT,
+                user_prompt,
+                0.7,
+                EmailIntroduction,
             )
 
-            intro = response.output_parsed
-            if intro and not intro.greeting.startswith(f"Hey {name}"):
-                intro.greeting = f"Hey {name}, here is your daily digest of AI news for {current_date}."
+        if intro and not intro.greeting.startswith(f"Hey {name}"):
+            intro.greeting = f"Hey {name}, here is your daily digest of AI news for {current_date}."
 
+        if intro:
             return intro
-        except Exception as e:
-            print(f"Error generating introduction: {e}")
-            return EmailIntroduction(
-                greeting=f"Hey {name}, here is your daily digest of AI news for {current_date}.",
-                introduction="Here are the top AI news articles ranked by relevance to your interests.",
-            )
+
+        return EmailIntroduction(
+            greeting=f"Hey {name}, here is your daily digest of AI news for {current_date}.",
+            introduction="Here are the top AI news articles ranked by relevance to your interests.",
+        )
 
     def create_email_digest(self, ranked_articles: List[dict], limit: int = 10) -> EmailDigest:
         top_articles = ranked_articles[:limit]

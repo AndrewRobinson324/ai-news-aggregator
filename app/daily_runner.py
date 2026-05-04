@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from app.config import llm_backend, llm_provider_conflict_message
 from app.runner import run_scrapers
 from app.services.process_anthropic import process_anthropic_markdown
 from app.services.process_digest import process_digests
@@ -24,6 +25,14 @@ def run_daily_pipeline(hours: int = 24, top_n: int = 10) -> dict:
     logger.info("=" * 60)
     logger.info("Starting Daily AI News Aggregator Pipeline")
     logger.info("=" * 60)
+
+    conflict = llm_provider_conflict_message()
+    if conflict:
+        logger.warning(conflict)
+    else:
+        backend = llm_backend()
+        if backend != "none":
+            logger.info("LLM backend: %s", backend)
 
     results = {
         "start_time": start_time.isoformat(),

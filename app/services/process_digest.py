@@ -2,6 +2,7 @@ import logging
 from typing import Optional
 
 from app.agent.digest_agent import DigestAgent
+from app.config import digest_llm_batch_size, llm_backend
 from app.database.repository import Repository
 
 logging.basicConfig(
@@ -10,6 +11,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def _article_ref(article: dict) -> str:
+    return f"{article['type']}:{article['id']}"
 
 
 def process_digests(limit: Optional[int] = None) -> dict:
@@ -21,23 +26,33 @@ def process_digests(limit: Optional[int] = None) -> dict:
     processed = 0
     failed = 0
 
-    logger.info(f"Starting digest processing for {total} articles")
+    backend = llm_backend()
+    if backend == "none":
+        batch_size = total if total > 0 else 1
+    else:
+        batch_size = digest_llm_batch_size()
 
-    for idx, article in enumerate(articles, 1):
-        article_type = article["type"]
-        article_id = article["id"]
-        article_title = article["title"][:60] + "..." if len(article["title"]) > 60 else article["title"]
+    logger.info(f"Starting digest processing for {total} articles (batch_size={batch_size}, backend={backend})")
 
-        logger.info(f"[{idx}/{total}] Processing {article_type}: {article_title} (ID: {article_id})")
+    for start in range(0, total, batch_size):
+        chunk = articles[start : start + batch_size]
+        batch_no = start // batch_size + 1
+        logger.info(f"[batch {batch_no}] Digesting {len(chunk)} articles")
 
-        try:
-            digest_result = agent.generate_digest(
-                title=article["title"],
-                content=article["content"],
-                article_type=article_type,
-            )
+        results = agent.generate_digests_batch(chunk)
 
-            if digest_result:
+        for article in chunk:
+            article_type = article["type"]
+            article_id = article["id"]
+            ref = _article_ref(article)
+
+            digest_result = results.get(ref)
+            if not digest_result:
+                logger.warning(f"✗ Missing digest for {article_type} {article_id}; skipping DB write")
+                failed += 1
+                continue
+
+            try:
                 repo.create_digest(
                     article_type=article_type,
                     article_id=article_id,
@@ -48,12 +63,9 @@ def process_digests(limit: Optional[int] = None) -> dict:
                 )
                 processed += 1
                 logger.info(f"✓ Successfully created digest for {article_type} {article_id}")
-            else:
+            except Exception as e:
                 failed += 1
-                logger.warning(f"✗ Failed to generate digest for {article_type} {article_id}")
-        except Exception as e:
-            failed += 1
-            logger.error(f"✗ Error processing {article_type} {article_id}: {e}")
+                logger.error(f"✗ Error saving digest for {article_type} {article_id}: {e}")
 
     logger.info(f"Processing complete: {processed} processed, {failed} failed out of {total} total")
 
