@@ -1,4 +1,4 @@
-# Andrew's AI News Aggregator
+# My personal AI News Aggregator
 
 This is my personal AI news pipeline.
 
@@ -22,11 +22,47 @@ On each run, the pipeline does five steps:
 LLM-powered digests and ranking are optional:
 
 - **Template mode:** leave `USE_OPENAI`, `USE_GEMINI`, and `USE_OLLAMA` unset/disabled — no LLM calls; excerpts and recency-only ranking.
-- **Gemini:** API key from [Google AI Studio](https://aistudio.google.com/apikey), then `USE_GEMINI=true` and `GEMINI_API_KEY=...`. The free tier allows very **few requests per day per model**, so the pipeline **batches digests** (`DIGEST_LLM_BATCH_SIZE`, default 8) to use roughly **one API call per chunk** instead of one call per article, plus one ranking call and one email-intro call.
+- **Gemini:** API key from [Google AI Studio](https://aistudio.google.com/apikey), then `USE_GEMINI=true` and `GEMINI_API_KEY=...`. The free tier allows very **few requests per day per model**, so the pipeline **batches digests** (`DIGEST_LLM_BATCH_SIZE`, default 8) to use roughly **one API call per chunk** instead of one call per article, plus one ranking call and one email-intro call. I found it did not work on free version
 - **OpenAI:** `USE_OPENAI=true` and `OPENAI_API_KEY` (typically billed).
 - **Ollama (local, no cloud quota):** install [Ollama](https://ollama.com/), run `ollama serve`, pull a model (`ollama pull llama3.2`), then set `USE_OLLAMA=true` and optionally `OLLAMA_MODEL` (defaults to `llama3.2`). Turn off cloud flags (`USE_GEMINI=false`, `USE_OPENAI=false`) or set `LLM_PROVIDER=ollama`. Large batched digests can be slow — raise `OLLAMA_TIMEOUT` (seconds, default `600`) if requests time out.
 
 If more than one of Gemini / OpenAI / Ollama is enabled, set `LLM_PROVIDER=gemini`, `openai`, or `ollama`.
+
+## How this project works (detailed overview)
+### End-to-end flow
+The CLI (`main.py`) calls `run_daily_pipeline(hours, top_n)` in `app/daily_runner.py`. **`hours`** filters how far back to look when scraping new items and when selecting digests for the email. **`top_n`** is how many ranked articles appear in the message body after curation.
+```mermaid
+flowchart TB
+  subgraph scrape [Scrape]
+    RSS[RSS feeds]
+    DB1[("Postgres article tables")]
+    RSS --> DB1
+  end
+  subgraph enrich [Enrich]
+    AM[Anthropic to markdown]
+    YT[YouTube transcripts]
+    DB1 --> AM
+    DB1 --> YT
+  end
+  subgraph digest3 [Digests]
+    DA[Digest agent]
+    DB2[("digests table")]
+    DB1 --> DA
+    DA --> DB2
+  end
+  subgraph email4 [Email]
+    CA[Curator ranks by profile]
+    EA[Email agent builds HTML]
+    SMTP[Gmail SMTP]
+    DB2 --> CA
+    CA --> EA
+    EA --> SMTP
+  end
+```
+## Data Model
+Source content lives in three tables (one per publisher shape): youtube_videos, openai_articles, anthropic_articles. Each row is keyed by its natural id (video_id, RSS guid, etc.). Anthropic rows gain a markdown column after enrichment; YouTube rows gain transcript text or a marker when captions are missing.
+
+digests stores one summary per article the pipeline has processed: a short title and summary plus article_type and article_id pointing back to the source row. Digests are derived—if you change models or prompts, you can delete digest rows and re-run to regenerate.
 
 ## Stack
 
